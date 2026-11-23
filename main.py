@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
 from typing import Any
@@ -7,16 +9,23 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-APP_VERSION = "1.0.0"
-OVERPASS_URLS = [
+APP_VERSION = "1.0.1"
+logger = logging.getLogger("arina-server")
+
+OVERPASS_URLS = list(dict.fromkeys([
     os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter"),
     "https://overpass.kumi.systems/api/interpreter",
-]
+]))
 VALHALLA_URL = os.getenv("VALHALLA_URL", "https://valhalla1.openstreetmap.de")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+# Keep the complete provider operation comfortably below the Flutter client's
+# 40-second timeout, including the fallback Overpass instance.
+OVERPASS_REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=4.0)
+OVERPASS_TOTAL_TIMEOUT_SECONDS = 27.0
+OTHER_PROVIDER_TIMEOUT = httpx.Timeout(20.0, connect=6.0)
 
 app = FastAPI(
     title="Arina Server",
@@ -49,21 +58,15 @@ def _overpass_escape(value: str) -> str:
 
 
 def _category_selectors(category: str, around: str) -> list[str]:
+    # nwr combines nodes, ways and relations into one selector. The previous
+    # implementation emitted three separate selectors for every category.
     categories: dict[str, list[str]] = {
-        "Кафе": ['node["amenity"="cafe"]', 'way["amenity"="cafe"]', 'relation["amenity"="cafe"]'],
-        "Музеи": ['node["tourism"="museum"]', 'way["tourism"="museum"]', 'relation["tourism"="museum"]'],
-        "Парки": [
-            'node["leisure"~"^(park|garden|nature_reserve)$"]',
-            'way["leisure"~"^(park|garden|nature_reserve)$"]',
-            'relation["leisure"~"^(park|garden|nature_reserve)$"]',
-        ],
+        "Кафе": ['nwr["amenity"="cafe"]'],
+        "Музеи": ['nwr["tourism"="museum"]'],
+        "Парки": ['nwr["leisure"~"^(park|garden|nature_reserve)$"]'],
         "Достопримечательности": [
-            'node["tourism"~"^(attraction|viewpoint|artwork)$"]',
-            'way["tourism"~"^(attraction|viewpoint|artwork)$"]',
-            'relation["tourism"~"^(attraction|viewpoint|artwork)$"]',
-            'node["historic"]',
-            'way["historic"]',
-            'relation["historic"]',
+            'nwr["tourism"~"^(attraction|viewpoint|artwork)$"]',
+            'nwr["historic"]',
         ],
     }
     selected = categories.get(category)
@@ -78,24 +81,56 @@ def _category_selectors(category: str, around: str) -> list[str]:
 
 
 async def _overpass_request(query: str) -> dict[str, Any]:
-    headers = {"User-Agent": "ArinaServer/1.0 (MosTravel mobile app)"}
+    headers = {
+        "User-Agent": "ArinaServer/1.0 (MosTravel mobile app)",
+        "Accept": "application/json",
+    }
     last_error: Exception | None = None
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
-        for endpoint in OVERPASS_URLS:
-            try:
-                response = await client.post(endpoint, data={"data": query})
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or not isinstance(payload.get("elements"), list):
-                    raise ValueError("Overpass returned an unexpected response")
-                return payload
-            except (httpx.HTTPError, ValueError) as exc:
-                last_error = exc
+    try:
+        async with asyncio.timeout(OVERPASS_TOTAL_TIMEOUT_SECONDS):
+            async with httpx.AsyncClient(
+                timeout=OVERPASS_REQUEST_TIMEOUT,
+                headers=headers,
+                follow_redirects=True,
+            ) as client:
+                for endpoint in OVERPASS_URLS:
+                    try:
+                        response = await client.post(endpoint, data={"data": query})
+                        response.raise_for_status()
+                        payload = response.json()
+                        if (
+                            not isinstance(payload, dict)
+                            or not isinstance(payload.get("elements"), list)
+                        ):
+                            raise ValueError("Overpass returned an unexpected response")
+                        logger.info(
+                            "Overpass request succeeded via %s (%s elements)",
+                            endpoint,
+                            len(payload["elements"]),
+                        )
+                        return payload
+                    except (httpx.HTTPError, ValueError) as exc:
+                        last_error = exc
+                        logger.warning(
+                            "Overpass endpoint %s failed: %s",
+                            endpoint,
+                            type(exc).__name__,
+                        )
+    except TimeoutError as exc:
+        last_error = exc
+        logger.warning(
+            "Overpass discovery exceeded total timeout of %.1fs",
+            OVERPASS_TOTAL_TIMEOUT_SECONDS,
+        )
 
+    logger.error(
+        "All Overpass endpoints failed; last error: %s",
+        type(last_error).__name__ if last_error else "unknown",
+    )
     raise HTTPException(
         status_code=502,
-        detail=f"Places provider is temporarily unavailable: {type(last_error).__name__ if last_error else 'unknown error'}",
+        detail="Places provider is temporarily unavailable. Please try again shortly.",
     )
 
 
@@ -114,7 +149,7 @@ async def discover_places(
     around = f"around:{radius},{lat},{lon}"
     selectors = _category_selectors(category, around)
     query = (
-        "[out:json][timeout:25];("
+        "[out:json][timeout:18];("
         + "".join(selectors)
         + ");out center tags;"
     )
@@ -131,10 +166,8 @@ async def search_places(
     term = _overpass_escape(q)
     around = f"around:{radius},{lat},{lon}"
     query = (
-        '[out:json][timeout:25];('
-        f'node["name"~"{term}",i]({around});'
-        f'way["name"~"{term}",i]({around});'
-        f'relation["name"~"{term}",i]({around});'
+        '[out:json][timeout:18];('
+        f'nwr["name"~"{term}",i]({around});'
         ");out center tags;"
     )
     return await _overpass_request(query)
@@ -150,12 +183,16 @@ async def walking_route(body: WalkingRouteRequest) -> dict[str, Any]:
         "directions_options": {"units": "kilometers"},
     }
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=OTHER_PROVIDER_TIMEOUT) as client:
             response = await client.post(f"{VALHALLA_URL.rstrip('/')}/route", json=payload)
             response.raise_for_status()
             result = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Walking route provider is temporarily unavailable") from exc
+        logger.exception("Walking route provider request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Walking route provider is temporarily unavailable",
+        ) from exc
 
     if not isinstance(result, dict) or "trip" not in result:
         raise HTTPException(status_code=502, detail="Walking route provider returned an invalid route")
@@ -176,11 +213,12 @@ async def weather(
         "forecast_days": 1,
     }
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=OTHER_PROVIDER_TIMEOUT) as client:
             response = await client.get(OPEN_METEO_URL, params=params)
             response.raise_for_status()
             result = response.json()
     except (httpx.HTTPError, ValueError) as exc:
+        logger.exception("Weather provider request failed")
         raise HTTPException(status_code=502, detail="Weather provider is temporarily unavailable") from exc
 
     if not isinstance(result, dict) or "current" not in result:
