@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -11,23 +13,29 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 logger = logging.getLogger("arina-server")
 
 # Prefer the VK Maps Overpass instance, which publishes an explicit policy
 # allowing use in projects. Keep two independent global instances as fallbacks.
 OVERPASS_URLS = list(dict.fromkeys([
-    os.getenv("OVERPASS_URL", "https://maps.mail.ru/osm/tools/overpass/api/interpreter"),
+    os.getenv("OVERPASS_URL", "https://ovp.dresel.systems/api/interpreter"),
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]))
 VALHALLA_URL = os.getenv("VALHALLA_URL", "https://valhalla1.openstreetmap.de")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Keep the complete provider operation comfortably below the Flutter client's
-# 40-second timeout, including the fallback Overpass instance.
-OVERPASS_REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=4.0)
-OVERPASS_TOTAL_TIMEOUT_SECONDS = 27.0
+# Four independent Overpass instances are tried sequentially. Each attempt is
+# short so a dead upstream cannot consume the Flutter client's full timeout.
+OVERPASS_REQUEST_TIMEOUT = httpx.Timeout(7.5, connect=3.0)
+OVERPASS_TOTAL_TIMEOUT_SECONDS = 32.0
+PLACES_CACHE_TTL_SECONDS = 15 * 60
+PLACES_STALE_TTL_SECONDS = 24 * 60 * 60
+_places_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_places_cache_lock = asyncio.Lock()
+_places_provider_semaphore = asyncio.Semaphore(2)
 OTHER_PROVIDER_TIMEOUT = httpx.Timeout(20.0, connect=6.0)
 
 app = FastAPI(
@@ -84,57 +92,87 @@ def _category_selectors(category: str, around: str) -> list[str]:
 
 
 async def _overpass_request(query: str) -> dict[str, Any]:
+    """Fetch places with bounded failover and stale-cache fallback."""
+    cache_key = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    async with _places_cache_lock:
+        cached = _places_cache.get(cache_key)
+        if cached and now - cached[0] <= PLACES_CACHE_TTL_SECONDS:
+            logger.info("Places cache hit")
+            return cached[1]
+
     headers = {
-        "User-Agent": "ArinaServer/1.0 (MosTravel mobile app)",
+        "User-Agent": "MosTravel-ArinaServer/1.0.3 (OpenStreetMap place discovery; contact via GitHub repository)",
         "Accept": "application/json",
     }
     last_error: Exception | None = None
 
-    try:
-        async with asyncio.timeout(OVERPASS_TOTAL_TIMEOUT_SECONDS):
-            async with httpx.AsyncClient(
-                timeout=OVERPASS_REQUEST_TIMEOUT,
-                headers=headers,
-                follow_redirects=True,
-            ) as client:
-                for endpoint in OVERPASS_URLS:
-                    try:
-                        response = await client.post(endpoint, data={"data": query})
-                        response.raise_for_status()
-                        payload = response.json()
-                        if (
-                            not isinstance(payload, dict)
-                            or not isinstance(payload.get("elements"), list)
-                        ):
-                            raise ValueError("Overpass returned an unexpected response")
-                        logger.info(
-                            "Overpass request succeeded via %s (%s elements)",
-                            endpoint,
-                            len(payload["elements"]),
-                        )
-                        return payload
-                    except (httpx.HTTPError, ValueError) as exc:
-                        last_error = exc
-                        if isinstance(exc, httpx.HTTPStatusError):
-                            response = exc.response
-                            logger.warning(
-                                "Overpass endpoint %s returned HTTP %s: %s",
+    async with _places_provider_semaphore:
+        try:
+            async with asyncio.timeout(OVERPASS_TOTAL_TIMEOUT_SECONDS):
+                async with httpx.AsyncClient(
+                    timeout=OVERPASS_REQUEST_TIMEOUT,
+                    headers=headers,
+                    follow_redirects=True,
+                ) as client:
+                    for endpoint in OVERPASS_URLS:
+                        try:
+                            response = await client.post(endpoint, data={"data": query})
+                            if response.status_code in (403, 406, 429):
+                                logger.warning(
+                                    "Overpass endpoint %s refused request with HTTP %s",
+                                    endpoint,
+                                    response.status_code,
+                                )
+                                last_error = httpx.HTTPStatusError(
+                                    f"Overpass HTTP {response.status_code}",
+                                    request=response.request,
+                                    response=response,
+                                )
+                                continue
+                            response.raise_for_status()
+                            payload = response.json()
+                            if (
+                                not isinstance(payload, dict)
+                                or not isinstance(payload.get("elements"), list)
+                            ):
+                                raise ValueError("Overpass returned an unexpected response")
+                            async with _places_cache_lock:
+                                _places_cache[cache_key] = (time.monotonic(), payload)
+                            logger.info(
+                                "Overpass request succeeded via %s (%s elements)",
                                 endpoint,
-                                response.status_code,
-                                response.text[:300].replace("\\n", " "),
+                                len(payload["elements"]),
                             )
-                        else:
-                            logger.warning(
-                                "Overpass endpoint %s failed: %s",
-                                endpoint,
-                                type(exc).__name__,
-                            )
-    except TimeoutError as exc:
-        last_error = exc
-        logger.warning(
-            "Overpass discovery exceeded total timeout of %.1fs",
-            OVERPASS_TOTAL_TIMEOUT_SECONDS,
-        )
+                            return payload
+                        except (httpx.HTTPError, ValueError) as exc:
+                            last_error = exc
+                            if isinstance(exc, httpx.HTTPStatusError):
+                                logger.warning(
+                                    "Overpass endpoint %s returned HTTP %s",
+                                    endpoint,
+                                    exc.response.status_code,
+                                )
+                            else:
+                                logger.warning(
+                                    "Overpass endpoint %s failed: %s",
+                                    endpoint,
+                                    type(exc).__name__,
+                                )
+        except TimeoutError as exc:
+            last_error = exc
+            logger.warning(
+                "Overpass discovery exceeded total timeout of %.1fs",
+                OVERPASS_TOTAL_TIMEOUT_SECONDS,
+            )
+
+    # A stale successful response is better than making the entire planner
+    # unusable during a temporary outage. Keep the normal Overpass schema.
+    async with _places_cache_lock:
+        cached = _places_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] <= PLACES_STALE_TTL_SECONDS:
+            logger.warning("All Overpass endpoints failed; serving stale places cache")
+            return cached[1]
 
     logger.error(
         "All Overpass endpoints failed; last error: %s",
@@ -161,7 +199,7 @@ async def discover_places(
     around = f"around:{radius},{lat},{lon}"
     selectors = _category_selectors(category, around)
     query = (
-        "[out:json][timeout:18];("
+        "[out:json][timeout:12];("
         + "".join(selectors)
         + ");out center tags;"
     )
@@ -178,7 +216,7 @@ async def search_places(
     term = _overpass_escape(q)
     around = f"around:{radius},{lat},{lon}"
     query = (
-        '[out:json][timeout:18];('
+        '[out:json][timeout:12];('
         f'nwr["name"~"{term}",i]({around});'
         ");out center tags;"
     )
