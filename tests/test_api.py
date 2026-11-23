@@ -10,7 +10,7 @@ def test_health_endpoint():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["service"] == "arina-server"
-    assert response.json()["version"] == "1.0.2"
+    assert response.json()["version"] == "1.0.3"
 
 
 def test_discover_category_query_is_scoped_and_uses_combined_selector():
