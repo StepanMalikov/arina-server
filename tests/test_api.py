@@ -10,18 +10,27 @@ def test_health_endpoint():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["service"] == "arina-server"
+    assert response.json()["version"] == "1.0.1"
 
 
-def test_discover_category_query_is_scoped():
+def test_discover_category_query_is_scoped_and_uses_combined_selector():
     selectors = _category_selectors("Парки", "around:5000,55.75,37.61")
-    assert len(selectors) == 3
-    assert all("leisure" in selector for selector in selectors)
+    assert len(selectors) == 1
+    assert selectors[0].startswith('nwr["leisure"')
+    assert "around:5000,55.75,37.61" in selectors[0]
+
+
+def test_sights_category_uses_two_relevant_selectors():
+    selectors = _category_selectors("Достопримечательности", "around:5000,55.75,37.61")
+    assert len(selectors) == 2
+    assert all(selector.startswith("nwr") for selector in selectors)
     assert all("around:5000,55.75,37.61" in selector for selector in selectors)
 
 
 def test_unknown_category_falls_back_to_all_supported_categories():
     selectors = _category_selectors("Все места", "around:5000,55.75,37.61")
-    assert len(selectors) > 3
+    assert len(selectors) == 5
+    assert all(selector.startswith("nwr") for selector in selectors)
 
 
 def test_route_requires_at_least_two_locations():
