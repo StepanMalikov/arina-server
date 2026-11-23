@@ -11,12 +11,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 logger = logging.getLogger("arina-server")
 
+# Prefer the VK Maps Overpass instance, which publishes an explicit policy
+# allowing use in projects. Keep two independent global instances as fallbacks.
 OVERPASS_URLS = list(dict.fromkeys([
-    os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter"),
-    "https://overpass.kumi.systems/api/interpreter",
+    os.getenv("OVERPASS_URL", "https://maps.mail.ru/osm/tools/overpass/api/interpreter"),
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
 ]))
 VALHALLA_URL = os.getenv("VALHALLA_URL", "https://valhalla1.openstreetmap.de")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -112,11 +115,20 @@ async def _overpass_request(query: str) -> dict[str, Any]:
                         return payload
                     except (httpx.HTTPError, ValueError) as exc:
                         last_error = exc
-                        logger.warning(
-                            "Overpass endpoint %s failed: %s",
-                            endpoint,
-                            type(exc).__name__,
-                        )
+                        if isinstance(exc, httpx.HTTPStatusError):
+                            response = exc.response
+                            logger.warning(
+                                "Overpass endpoint %s returned HTTP %s: %s",
+                                endpoint,
+                                response.status_code,
+                                response.text[:300].replace("\\n", " "),
+                            )
+                        else:
+                            logger.warning(
+                                "Overpass endpoint %s failed: %s",
+                                endpoint,
+                                type(exc).__name__,
+                            )
     except TimeoutError as exc:
         last_error = exc
         logger.warning(
