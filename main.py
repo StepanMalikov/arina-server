@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 logger = logging.getLogger("arina-server")
 
 # Prefer the VK Maps Overpass instance, which publishes an explicit policy
@@ -91,9 +91,12 @@ def _category_selectors(category: str, around: str) -> list[str]:
     return [f"{selector}({around});" for selector in selected]
 
 
-async def _overpass_request(query: str) -> dict[str, Any]:
+async def _overpass_request(query: str, *, cache_scope: str | None = None) -> dict[str, Any]:
     """Fetch places with bounded failover and stale-cache fallback."""
-    cache_key = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    # Discovery cache keys can deliberately use a coarse geographic cell so
+    # small GPS drift does not bypass a recent successful result.
+    cache_material = cache_scope if cache_scope is not None else query
+    cache_key = hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
     now = time.monotonic()
     async with _places_cache_lock:
         cached = _places_cache.get(cache_key)
@@ -102,7 +105,7 @@ async def _overpass_request(query: str) -> dict[str, Any]:
             return cached[1]
 
     headers = {
-        "User-Agent": "MosTravel-ArinaServer/1.0.3 (OpenStreetMap place discovery; contact via GitHub repository)",
+        "User-Agent": "MosTravel-ArinaServer/1.0.4 (OpenStreetMap place discovery; contact via GitHub repository)",
         "Accept": "application/json",
     }
     last_error: Exception | None = None
@@ -203,7 +206,8 @@ async def discover_places(
         + "".join(selectors)
         + ");out center tags;"
     )
-    return await _overpass_request(query)
+    cache_scope = f"discover:{category.strip().casefold()}:{round(lat, 2)}:{round(lon, 2)}:{radius}"
+    return await _overpass_request(query, cache_scope=cache_scope)
 
 
 @app.get("/api/v1/places/search")
